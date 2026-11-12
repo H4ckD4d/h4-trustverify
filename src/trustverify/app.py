@@ -3,12 +3,12 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta, date
 from typing import Literal
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 from .db import Base, AuditEvent, audit, engine_for_env, uid
-from .security import current_actor
+from .security import current_actor, require_write
 from .model import *
 
 @asynccontextmanager
@@ -41,6 +41,8 @@ async def add_headers(request: Request, call_next):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Cache-Control'] = 'no-store'
     response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
     return response
 
 @app.get('/healthz', include_in_schema=False)
@@ -48,11 +50,14 @@ def healthz():
     return {'ok': True}
 
 @app.get('/v1/audit')
-def audit_list(auth=Depends(current_actor), session: Session=Depends(session_dep)):
+def audit_list(limit:int=Query(default=50,ge=1,le=100),offset:int=Query(default=0,ge=0,le=10000),
+               auth=Depends(current_actor),session: Session=Depends(session_dep)):
     rows = session.scalars(select(AuditEvent).where(AuditEvent.tenant_id == auth['tenant_id'])
-                           .order_by(AuditEvent.created_at.desc()).limit(100)).all()
-    return {'events': [{'kind': r.kind, 'resource_id': r.resource_id,
-                        'actor_id': r.actor_id, 'at': r.created_at.isoformat()} for r in rows]}
+                           .order_by(AuditEvent.created_at.desc(),AuditEvent.id.desc())
+                           .offset(offset).limit(limit)).all()
+    return {'events': [{'kind':r.kind,'resource_id':r.resource_id,'actor_id':r.actor_id,
+                        'at':r.created_at.isoformat()} for r in rows],
+            'limit':limit,'offset':offset}
 
 import re
 from sqlalchemy.exc import IntegrityError
@@ -64,7 +69,7 @@ class NewRequest(BaseModel):
     expires_minutes: int=Field(default=60,ge=1,le=10080)
 
 @app.post('/v1/requests',status_code=201)
-def create_request(payload: NewRequest,auth=Depends(current_actor),session: Session=Depends(session_dep)):
+def create_request(payload: NewRequest,auth=Depends(require_write),session: Session=Depends(session_dep)):
     request=ApprovalRequest(tenant_id=auth['tenant_id'],creator=auth['actor_id'],
         reference=payload.reference,payload_sha256=payload.payload_sha256,
         required=payload.required,expires_at=datetime.now(timezone.utc)+timedelta(minutes=payload.expires_minutes),status='pending')
@@ -79,7 +84,7 @@ def get_request(request_id: str,auth=Depends(current_actor),session: Session=Dep
     return {'id':request.id,'reference':request.reference,'status':status,'approvals':count,'required':request.required}
 
 @app.post('/v1/requests/{request_id}/approve')
-def approve(request_id: str,auth=Depends(current_actor),session: Session=Depends(session_dep)):
+def approve(request_id: str,auth=Depends(require_write),session: Session=Depends(session_dep)):
     request=require_tenant(session,ApprovalRequest,request_id,auth['tenant_id'])
     if request.status!='pending':
         raise HTTPException(409,'Request not pending')
@@ -97,3 +102,14 @@ def approve(request_id: str,auth=Depends(current_actor),session: Session=Depends
         request.status='approved'
     audit(session,auth,'request.approved',request_id);session.commit()
     return {'id':request_id,'status':request.status,'approvals':count,'required':request.required}
+
+@app.post('/v1/requests/{request_id}/cancel')
+def cancel_request(request_id: str,auth=Depends(require_write),session: Session=Depends(session_dep)):
+    request=require_tenant(session,ApprovalRequest,request_id,auth['tenant_id'])
+    if request.status!='pending':
+        raise HTTPException(409,'Only pending requests can be canceled')
+    if auth['actor_id']!=request.creator and auth['role']!='admin':
+        raise HTTPException(403,'Only creator or admin can cancel')
+    request.status='canceled'
+    audit(session,auth,'request.canceled',request.id);session.commit()
+    return {'id':request.id,'status':request.status}
